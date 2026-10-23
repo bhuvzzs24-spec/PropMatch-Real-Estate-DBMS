@@ -1,0 +1,249 @@
+import { NextRequest, NextResponse } from "next/server";
+
+import pool from "@/lib/db/mysql";
+import { requireAuth } from "@/lib/auth/requireAuth";
+
+export async function GET(request: NextRequest) {
+  try {
+    const auth = await requireAuth(request);
+
+    if (!auth) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: "UNAUTHORIZED",
+            message: "Unauthorized",
+          },
+        },
+        { status: 401 }
+      );
+    }
+
+    if (auth.role !== "ADMIN") {
+      return NextResponse.json(
+        {
+          success: false,
+          error: {
+            code: "FORBIDDEN",
+            message: "Forbidden",
+          },
+        },
+        { status: 403 }
+      );
+    }
+
+    const [[totals]] = await pool.execute<any[]>(`
+      SELECT
+        (SELECT COUNT(*) FROM users) AS users,
+        (SELECT COUNT(*) FROM agent_profiles) AS agents,
+        (SELECT COUNT(*) FROM properties WHERE status = 'ACTIVE') AS activeListings,
+        (SELECT COUNT(*) FROM inquiries) AS inquiries,
+        (SELECT COUNT(*) FROM site_visits) AS visits
+    `);
+
+    const [avgPricePerSqftByLocality] = await pool.execute<any[]>(`
+      SELECT
+        l.city,
+        l.locality,
+        COUNT(p.property_id) AS listings,
+        ROUND(
+          AVG(fn_price_per_sqft(p.price, p.area_sqft)),
+          2
+        ) AS avgPricePerSqft
+      FROM properties p
+      JOIN locations l
+        ON l.location_id = p.location_id
+      WHERE p.status = 'ACTIVE'
+      GROUP BY l.city, l.locality
+      ORDER BY avgPricePerSqft DESC
+    `);
+
+    const [topAgents] = await pool.execute<any[]>(`
+      SELECT
+        u.user_id AS agentId,
+        u.full_name AS agentName,
+        COUNT(DISTINCT p.property_id) AS totalListings,
+        COUNT(DISTINCT i.inquiry_id) AS totalInquiries
+      FROM users u
+      JOIN agent_profiles ap
+        ON ap.user_id = u.user_id
+      LEFT JOIN properties p
+        ON p.agent_id = u.user_id
+      LEFT JOIN inquiries i
+        ON i.property_id = p.property_id
+      GROUP BY u.user_id, u.full_name
+      ORDER BY totalListings DESC, totalInquiries DESC
+      LIMIT 10
+    `);
+
+    const mongoTrending = await getTrendingProperties();
+
+    const [topSearchedCities] = await getTopSearchedCities();
+
+    const [inquiryStatusRows] = await pool.execute<any[]>(`
+      SELECT
+        status,
+        COUNT(*) AS count
+      FROM inquiries
+      GROUP BY status
+    `);
+
+    const inquiryStatusBreakdown: Record<string, number> = {};
+
+    for (const row of inquiryStatusRows) {
+      inquiryStatusBreakdown[String(row.status)] = Number(row.count);
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: {
+        totals: {
+          users: Number(totals?.users ?? 0),
+          agents: Number(totals?.agents ?? 0),
+          activeListings: Number(totals?.activeListings ?? 0),
+          inquiries: Number(totals?.inquiries ?? 0),
+          visits: Number(totals?.visits ?? 0),
+        },
+        avgPricePerSqftByLocality,
+        topAgents,
+        trendingProperties: mongoTrending,
+        topSearchedCities,
+        inquiryStatusBreakdown,
+      },
+    });
+  } catch (error) {
+    console.error("Admin analytics GET error:", error);
+
+    return NextResponse.json(
+      {
+        success: false,
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "Failed to fetch admin analytics",
+        },
+      },
+      { status: 500 }
+    );
+  }
+}
+
+async function getTrendingProperties() {
+  try {
+    const { getMongoDb } = await import("@/lib/db/mongo");
+    const db = await getMongoDb();
+
+    const viewed = await db
+      .collection("user_activity")
+      .aggregate([
+        {
+          $match: {
+            eventType: "VIEW",
+            propertyId: { $ne: null },
+            createdAt: {
+              $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$propertyId",
+            views: { $sum: 1 },
+            uniqueViewers: { $addToSet: "$userId" },
+          },
+        },
+        {
+          $sort: { views: -1 },
+        },
+        {
+          $limit: 10,
+        },
+      ])
+      .toArray();
+
+    if (!viewed.length) return [];
+
+    const ids = viewed.map((row) => Number(row._id));
+
+    const [properties] = await pool.execute<any[]>(
+      `
+        SELECT
+          property_id AS propertyId,
+          title
+        FROM properties
+        WHERE property_id IN (${ids.map(() => "?").join(",")})
+      `,
+      ids
+    );
+
+    const propertyMap = new Map(
+      properties.map((property) => [Number(property.propertyId), property])
+    );
+
+    return viewed
+      .map((row) => {
+        const property = propertyMap.get(Number(row._id));
+
+        if (!property) return null;
+
+        return {
+          propertyId: Number(row._id),
+          title: property.title,
+          views: Number(row.views),
+          uniqueViewers: row.uniqueViewers.length,
+        };
+      })
+      .filter(Boolean);
+  } catch (error) {
+    console.error("Trending properties error:", error);
+    return [];
+  }
+}
+
+async function getTopSearchedCities() {
+  try {
+    const { getMongoDb } = await import("@/lib/db/mongo");
+    const db = await getMongoDb();
+
+    const rows = await db
+      .collection("user_activity")
+      .aggregate([
+        {
+          $match: {
+            eventType: "SEARCH",
+            createdAt: {
+              $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$metadata.filters.city",
+            searches: { $sum: 1 },
+          },
+        },
+        {
+          $match: {
+            _id: { $nin: [null, ""] },
+          },
+        },
+        {
+          $sort: { searches: -1 },
+        },
+        {
+          $limit: 10,
+        },
+      ])
+      .toArray();
+
+    return [
+      rows.map((row) => ({
+        city: String(row._id),
+        searches: Number(row.searches),
+      })),
+    ];
+  } catch (error) {
+    console.error("Top searched cities error:", error);
+    return [[]];
+  }
+}
